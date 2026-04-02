@@ -15,6 +15,7 @@
 - **深度 PSD** — 可单独导出深度 PSD，用于 3D/视差工作流
 - **预览输出** — 合成重建预览作为标准 ComfyUI IMAGE 输出
 - **HuggingFace 自动下载** — 首次使用时自动从 HuggingFace 下载模型
+- **显存优化** — 标签嵌入缓存、文本编码器卸载、分组卸载、可配置深度分辨率，适配低显存显卡
 
 ## 节点说明
 
@@ -94,6 +95,31 @@ pip install -r requirements.txt
 | `resolution` | 1280 | 处理分辨率（图像会居中填充为正方形） |
 | `num_inference_steps` | 30 | 扩散去噪步数（越多质量越好，速度越慢） |
 | `tblr_split` | true | 是否将对称部位（眼睛、耳朵、手套）拆分为左/右 |
+| `cache_tag_embeds` | true | 预计算并缓存标签嵌入，然后卸载文本编码器以节省显存 |
+| `group_offload` | false | 启用分组卸载，大幅降低峰值显存（实际占用约 0.2GB，预留约 7GB），但速度**慢 2–3 倍**。需要 `diffusers>=0.37.0` |
+| `resolution_depth` | -1 | 深度推理分辨率。-1 表示与图层相同。设低（如 720）可节省显存并加速深度估计 |
+
+### 显存优化指南
+
+**大多数用户（12GB+ 显存）：** 默认设置即可。`cache_tag_embeds=true` 已默认开启，节省约 2GB 显存且不影响速度，无需其他更改。
+
+**低显存用户（8–12 GB）：** 按以下顺序尝试，对速度影响从小到大：
+
+1. **`cache_tag_embeds=true`**（默认已开启）— 缓存文本嵌入并卸载文本编码器，节省约 2GB 显存，无速度损失
+2. **`resolution_depth=720`** — 以较低分辨率进行深度推理，然后放大回原始分辨率，质量损失很小
+3. **降低 `resolution`** — 例如使用 1024 而非 1280，同时减少显存占用和计算量
+4. **`group_offload=true`** — 最后手段。按需将单个模型块移入/移出 GPU，峰值实际占用降至约 0.2GB，但由于频繁 CPU↔GPU 传输**速度慢 2–3 倍**。需要 `pip install diffusers>=0.37.0`
+
+#### 实测对比：`group_offload` 开启 vs 关闭
+
+测试环境：RTX 5090，resolution=1280，steps=30，两组均开启 `cache_tag_embeds=true`：
+
+| 阶段 | group_offload=OFF | group_offload=ON |
+|------|-------------------|------------------|
+| UNet+VAE 加载后 | 7.94 GB | 0.21 GB |
+| LayerDiff 峰值（实际占用 / 预留） | 7.95 GB / 13.69 GB | 0.21 GB / 7.31 GB |
+| Marigold 峰值 | 2.49 GB | 0.07 GB |
+| **总耗时** | **138 秒** | **385 秒（慢 2.8 倍）** |
 
 ## 输出图层
 

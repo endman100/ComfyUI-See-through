@@ -28,6 +28,7 @@
 # If you find Marigold useful, we kindly ask you to cite our papers.
 # --------------------------------------------------------------------------
 import os.path as osp
+import gc
 import logging
 import numpy as np
 import torch
@@ -329,7 +330,7 @@ class MarigoldDepthPipeline(DiffusionPipeline):
                 )
                 cond_latent = rgb_latent[0]
 
-        if denoising_steps is None:
+        if denoising_steps is None or denoising_steps == -1:
             denoising_steps = self.default_denoising_steps
         if processing_res is None:
             processing_res = self.default_processing_resolution
@@ -529,6 +530,23 @@ class MarigoldDepthPipeline(DiffusionPipeline):
         )
         text_input_ids = text_inputs.input_ids.to(self.text_encoder.device)
         self.empty_text_embed = self.text_encoder(text_input_ids)[0].to(self.dtype)
+
+    def cache_tag_embeds(self, unload_textencoders=True):
+        if self.empty_text_embed is None:
+            self.encode_empty_text()
+        else:
+            unload_textencoders = False
+        if unload_textencoders:
+            self.text_encoder.cpu()
+            del self.text_encoder
+            # to suppress some warning msg
+            self.text_encoder = torch.nn.Identity()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    @property
+    def device(self) -> torch.device:
+        return self.unet.device
 
     @torch.no_grad()
     def single_infer(

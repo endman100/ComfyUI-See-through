@@ -15,6 +15,7 @@ Paper: [arxiv:2602.03749](https://arxiv.org/abs/2602.03749) (Conditionally accep
 - **Depth PSD** — Separate depth PSD export for 3D/parallax workflows
 - **Preview Output** — Blended reconstruction preview as a standard ComfyUI IMAGE output
 - **HuggingFace Auto-Download** — Models download automatically from HuggingFace on first use
+- **VRAM Optimization** — Tag embedding caching, text encoder unloading, group offload, and configurable depth resolution for low-VRAM GPUs
 
 ## Nodes
 
@@ -92,6 +93,31 @@ Drag any `.json` file into ComfyUI to load the workflow.
 | `resolution` | 1280 | Processing resolution (image is center-padded to square) |
 | `num_inference_steps` | 30 | Diffusion denoising steps (more = better quality, slower) |
 | `tblr_split` | true | Split symmetric parts (eyes, ears, handwear) into left/right |
+| `cache_tag_embeds` | true | Pre-compute and cache tag embeddings, then unload text encoders to save VRAM |
+| `group_offload` | false | Enable group offload to drastically reduce peak VRAM (allocated ~0.2GB, reserved ~7GB) at cost of **2–3x slower** speed. Requires `diffusers>=0.37.0` |
+| `resolution_depth` | -1 | Resolution for depth inference. -1 uses the same as layers. Lower values (e.g. 720) save VRAM and speed up depth estimation |
+
+### VRAM Optimization Guide
+
+**For most users (12GB+ VRAM):** The default settings work well. `cache_tag_embeds=true` is already enabled and saves ~2GB VRAM with zero speed impact. No other changes needed.
+
+**For low-VRAM users (8–12 GB):** Try the following settings in order, from least to most impact on speed:
+
+1. **`cache_tag_embeds=true`** (default, already enabled) — Caches text embeddings and unloads text encoders, saving ~2GB VRAM with no speed penalty
+2. **`resolution_depth=720`** — Run depth estimation at a lower resolution, then upscale back. Saves VRAM with minimal quality loss
+3. **Lower `resolution`** — E.g. 1024 instead of 1280, reduces both VRAM and computation
+4. **`group_offload=true`** — Last resort. Moves individual model blocks on/off GPU as needed, reducing peak allocated VRAM to ~0.2GB but **2–3x slower** due to frequent CPU↔GPU transfers. Requires `pip install diffusers>=0.37.0`
+
+#### Benchmark: `group_offload` ON vs OFF
+
+Tested on RTX 5090, resolution=1280, steps=30, `cache_tag_embeds=true` for both:
+
+| Stage | group_offload=OFF | group_offload=ON |
+|-------|-------------------|------------------|
+| UNet+VAE loaded | 7.94 GB | 0.21 GB |
+| LayerDiff peak (allocated / reserved) | 7.95 GB / 13.69 GB | 0.21 GB / 7.31 GB |
+| Marigold peak | 2.49 GB | 0.07 GB |
+| **Total time** | **138 s** | **385 s (2.8x slower)** |
 
 ## Output Layers
 

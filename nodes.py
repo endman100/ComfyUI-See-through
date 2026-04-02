@@ -253,6 +253,10 @@ class SeeThrough_LoadLayerDiffModel:
                                         "tooltip": "Optional path to a custom VAE checkpoint (.safetensors)"}),
                 "unet_ckpt": ("STRING", {"default": "",
                                          "tooltip": "Optional path to a custom UNet checkpoint"}),
+                "cache_tag_embeds": ("BOOLEAN", {"default": True,
+                                                  "tooltip": "Pre-compute and cache tag embeddings, then unload text encoders to save VRAM"}),
+                "group_offload": ("BOOLEAN", {"default": False,
+                                               "tooltip": "Enable group offload to reduce peak VRAM (~10GB) at cost of ~1.5x slower speed"}),
             },
         }
 
@@ -261,7 +265,7 @@ class SeeThrough_LoadLayerDiffModel:
     FUNCTION = "load_model"
     CATEGORY = "SeeThrough"
 
-    def load_model(self, model, vae_ckpt="", unet_ckpt=""):
+    def load_model(self, model, vae_ckpt="", unet_ckpt="", cache_tag_embeds=True, group_offload=False):
         dtype = torch.bfloat16
         pretrained = _resolve_model_path(model)
 
@@ -297,6 +301,24 @@ class SeeThrough_LoadLayerDiffModel:
         pipeline.text_encoder.to(dtype=dtype)
         pipeline.text_encoder_2.to(dtype=dtype)
 
+        pipeline._st_group_offload = False
+        if group_offload:
+            if hasattr(pipeline, 'enable_group_offload'):
+                print("[SeeThrough] Enabling group offload for LayerDiff pipeline", flush=True)
+                pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+                pipeline._st_group_offload = True
+            else:
+                print("[SeeThrough] WARNING: group_offload requires diffusers >= 0.37.0, skipping. Please upgrade: pip install diffusers>=0.37.0", flush=True)
+
+        if cache_tag_embeds:
+            if not pipeline._st_group_offload:
+                device = mm.get_torch_device()
+                pipeline.text_encoder.to(device)
+                pipeline.text_encoder_2.to(device)
+            print("[SeeThrough] Caching tag embeddings and unloading text encoders...", flush=True)
+            pipeline.cache_tag_embeds(unload_textencoders=True)
+            _log_vram("After cache_tag_embeds (text encoders unloaded)")
+
         _log_vram("LayerDiff model loaded (CPU)")
         print("[SeeThrough] LayerDiff model loaded to CPU (will move to GPU on demand)", flush=True)
         return (pipeline,)
@@ -311,6 +333,12 @@ class SeeThrough_LoadDepthModel:
                 "model": (model_list, {"default": DEFAULT_DEPTH_REPO,
                                        "tooltip": "HuggingFace repo ID or local model folder in models/SeeThrough/"}),
             },
+            "optional": {
+                "cache_tag_embeds": ("BOOLEAN", {"default": True,
+                                                  "tooltip": "Pre-compute empty text embedding and unload text encoder to save VRAM"}),
+                "group_offload": ("BOOLEAN", {"default": False,
+                                               "tooltip": "Enable group offload to reduce peak VRAM at cost of slower speed"}),
+            },
         }
 
     RETURN_TYPES = ("SEETHROUGH_DEPTH_MODEL",)
@@ -318,7 +346,7 @@ class SeeThrough_LoadDepthModel:
     FUNCTION = "load_model"
     CATEGORY = "SeeThrough"
 
-    def load_model(self, model):
+    def load_model(self, model, cache_tag_embeds=True, group_offload=False):
         dtype = torch.bfloat16
         pretrained = _resolve_model_path(model)
 
@@ -326,6 +354,23 @@ class SeeThrough_LoadDepthModel:
         unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder="unet")
         pipeline = MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)
         pipeline.to(dtype=dtype)
+
+        pipeline._st_group_offload = False
+        if group_offload:
+            if hasattr(pipeline, 'enable_group_offload'):
+                print("[SeeThrough] Enabling group offload for Marigold pipeline", flush=True)
+                pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+                pipeline._st_group_offload = True
+            else:
+                print("[SeeThrough] WARNING: group_offload requires diffusers >= 0.37.0, skipping. Please upgrade: pip install diffusers>=0.37.0", flush=True)
+
+        if cache_tag_embeds:
+            if not pipeline._st_group_offload:
+                device = mm.get_torch_device()
+                pipeline.text_encoder.to(device)
+            print("[SeeThrough] Caching empty text embedding and unloading text encoder...", flush=True)
+            pipeline.cache_tag_embeds(unload_textencoders=True)
+            _log_vram("After Marigold cache_tag_embeds (text encoder unloaded)")
 
         _log_vram("Depth model loaded (CPU)")
         print("[SeeThrough] Depth model loaded to CPU (will move to GPU on demand)", flush=True)
@@ -370,29 +415,40 @@ class SeeThrough_GenerateLayers:
         print(f"[SeeThrough] GenerateLayers: tag_version={tag_version}, resolution={resolution}, steps={num_inference_steps}", flush=True)
         _log_vram("GenerateLayers start")
 
-        pipeline.text_encoder.to(device)
-        pipeline.text_encoder_2.to(device)
-        _log_vram("Text encoders loaded to GPU")
+        is_group_offload = getattr(pipeline, '_st_group_offload', False)
+
+        has_cached = len(pipeline._cached_prompt_embeds) > 0
+        if has_cached:
+            print("[SeeThrough] Using cached tag embeddings", flush=True)
+            encode_fn = pipeline.encode_cropped_prompt_77tokens_cached
+        else:
+            if not is_group_offload:
+                pipeline.text_encoder.to(device)
+                pipeline.text_encoder_2.to(device)
+                _log_vram("Text encoders loaded to GPU")
+            encode_fn = pipeline.encode_cropped_prompt_77tokens
 
         if tag_version == "v2":
-            prompt_embeds, pooled_prompt_embeds = pipeline.encode_cropped_prompt_77tokens(VALID_BODY_PARTS_V2)
+            prompt_embeds, pooled_prompt_embeds = encode_fn(VALID_BODY_PARTS_V2)
         elif tag_version == "v3":
             body_tags = ["front hair", "back hair", "head", "neck", "neckwear",
                          "topwear", "handwear", "bottomwear", "legwear", "footwear",
                          "tail", "wings", "objects"]
             head_tags = ["headwear", "face", "irides", "eyebrow", "eyewhite",
                          "eyelash", "eyewear", "ears", "earwear", "nose", "mouth"]
-            body_embeds, body_pooled = pipeline.encode_cropped_prompt_77tokens(body_tags)
-            head_embeds, head_pooled = pipeline.encode_cropped_prompt_77tokens(head_tags)
+            body_embeds, body_pooled = encode_fn(body_tags)
+            head_embeds, head_pooled = encode_fn(head_tags)
         else:
             raise ValueError(f"Unknown tag version: {tag_version}")
 
-        pipeline.text_encoder.to(offload)
-        pipeline.text_encoder_2.to(offload)
-        _log_vram("Text encoders offloaded to CPU")
+        if not has_cached and not is_group_offload:
+            pipeline.text_encoder.to(offload)
+            pipeline.text_encoder_2.to(offload)
+            _log_vram("Text encoders offloaded to CPU")
 
-        pipeline.unet.to(device)
-        pipeline.vae.to(device)
+        if not is_group_offload:
+            pipeline.unet.to(device)
+            pipeline.vae.to(device)
         pipeline.trans_vae.to(device)
         mm.soft_empty_cache()
         _log_vram("UNet+VAE on GPU, ready for diffusion")
@@ -448,12 +504,13 @@ class SeeThrough_GenerateLayers:
                     full[hy1:hy1 + rst.shape[0], hx1:hx1 + rst.shape[1]] = rst
                     layer_dict[tag] = full
 
-        pipeline.unet.to(offload)
-        pipeline.vae.to(offload)
+        if not is_group_offload:
+            pipeline.unet.to(offload)
+            pipeline.vae.to(offload)
         pipeline.trans_vae.to(offload)
         mm.soft_empty_cache()
         _log_vram("GenerateLayers offloaded to CPU")
-        print(f"[SeeThrough] GenerateLayers complete: {len(layer_dict)} layers, pipeline offloaded to CPU", flush=True)
+        print(f"[SeeThrough] GenerateLayers complete: {len(layer_dict)} layers", flush=True)
 
         layers_data = SeeThrough_LayersData(layer_dict, fullpage, input_img, resolution, pad_size, pad_pos)
 
@@ -476,6 +533,10 @@ class SeeThrough_GenerateDepth:
                 "depth_model": ("SEETHROUGH_DEPTH_MODEL",),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 2**32 - 1}),
             },
+            "optional": {
+                "resolution_depth": ("INT", {"default": -1, "min": -1, "max": 2048, "step": 64,
+                                              "tooltip": "Resolution for depth inference. -1 uses the same resolution as layers. Lower values save VRAM and speed up inference."}),
+            },
         }
 
     RETURN_TYPES = ("SEETHROUGH_LAYERS_DEPTH", "IMAGE")
@@ -483,13 +544,14 @@ class SeeThrough_GenerateDepth:
     FUNCTION = "generate"
     CATEGORY = "SeeThrough"
 
-    def generate(self, layers, depth_model, seed=42):
+    def generate(self, layers, depth_model, seed=42, resolution_depth=-1):
         layer_dict = layers.layer_dict
         fullpage = layers.fullpage
         resolution = layers.resolution
         marigold = depth_model
         device = mm.get_torch_device()
         offload = torch.device("cpu")
+        is_group_offload = getattr(marigold, '_st_group_offload', False)
 
         print("[SeeThrough] GenerateDepth: running Marigold...", flush=True)
         _log_vram("GenerateDepth start")
@@ -531,19 +593,36 @@ class SeeThrough_GenerateDepth:
         fullpage_for_depth[..., -1] = blended_alpha
         img_list.append(fullpage_for_depth)
 
-        marigold.to(device=device)
-        mm.soft_empty_cache()
-        _log_vram("Marigold on GPU")
-        print("[SeeThrough] Marigold pipeline moved to GPU", flush=True)
+        src_h, src_w = resolution, resolution
+        if resolution_depth > 0 and resolution_depth != resolution:
+            depth_res = resolution_depth
+            depth_res = max(64, (depth_res // 8) * 8)
+            img_list_input = [smart_resize(img, (depth_res, depth_res)) for img in img_list]
+            print(f"[SeeThrough] Depth inference at resolution {depth_res} (layers at {resolution})", flush=True)
+        else:
+            img_list_input = img_list
+            depth_res = resolution
+
+        if not is_group_offload:
+            marigold.unet.to(device)
+            marigold.vae.to(device)
+            mm.soft_empty_cache()
+            _log_vram("Marigold on GPU")
+            print("[SeeThrough] Marigold pipeline moved to GPU", flush=True)
 
         seed_everything(seed)
-        pipe_out = marigold(color_map=None, show_progress_bar=False, img_list=img_list)
+        pipe_out = marigold(color_map=None, show_progress_bar=False, img_list=img_list_input)
         _log_vram("Marigold inference complete")
         depth_pred = pipe_out.depth_tensor.to(device="cpu", dtype=torch.float32).numpy()
 
-        marigold.to(device=offload)
-        mm.soft_empty_cache()
-        _log_vram("GenerateDepth offloaded to CPU")
+        if depth_res != resolution:
+            depth_pred = np.stack([smart_resize(d, (src_h, src_w)) for d in depth_pred])
+
+        if not is_group_offload:
+            marigold.unet.to(offload)
+            marigold.vae.to(offload)
+            mm.soft_empty_cache()
+            _log_vram("GenerateDepth offloaded to CPU")
 
         depth_dict = {}
         for ii, tag in enumerate(VALID_BODY_PARTS_V2):
