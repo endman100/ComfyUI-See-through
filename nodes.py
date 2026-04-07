@@ -31,19 +31,7 @@ print(f"[SeeThrough] CURRENT_DIR = {CURRENT_DIR}", flush=True)
 print(f"[SeeThrough] SEETHROUGH_COMMON_DIR = {SEETHROUGH_COMMON_DIR}", flush=True)
 print(f"[SeeThrough] common dir exists = {os.path.isdir(SEETHROUGH_COMMON_DIR)}", flush=True)
 
-# Mock pycocotools if not installed (only used for mask RLE, not needed here)
-try:
-    import pycocotools  # noqa: F401
-    print("[SeeThrough] pycocotools found", flush=True)
-except ImportError:
-    print("[SeeThrough] pycocotools not found, installing mock...", flush=True)
-    import types as _types
-    _mock_pycocotools = _types.ModuleType("pycocotools")
-    _mock_mask = _types.ModuleType("pycocotools.mask")
-    _mock_pycocotools.mask = _mock_mask
-    sys.modules["pycocotools"] = _mock_pycocotools
-    sys.modules["pycocotools.mask"] = _mock_mask
-
+# Set up search paths immediately (cheap string ops; must precede lazy imports)
 if SEETHROUGH_COMMON_DIR not in sys.path:
     sys.path.insert(0, SEETHROUGH_COMMON_DIR)
     print(f"[SeeThrough] Added to sys.path: {SEETHROUGH_COMMON_DIR}", flush=True)
@@ -52,32 +40,59 @@ if SEETHROUGH_ROOT_DIR not in sys.path:
     sys.path.insert(1, SEETHROUGH_ROOT_DIR)
     print(f"[SeeThrough] Added to sys.path: {SEETHROUGH_ROOT_DIR}", flush=True)
 
-_st_conflict_backup = {}
-for _prefix in ("utils", "modules"):
-    for _key in list(sys.modules.keys()):
-        if _key == _prefix or _key.startswith(_prefix + "."):
-            _st_conflict_backup[_key] = sys.modules.pop(_key)
-if _st_conflict_backup:
-    print(f"[SeeThrough] Temporarily removed {len(_st_conflict_backup)} conflicting sys.modules entries: "
-          f"{list(_st_conflict_backup.keys())[:10]}{'...' if len(_st_conflict_backup) > 10 else ''}", flush=True)
+# Heavy see-through imports are deferred to _st_lazy_init() to speed up ComfyUI startup.
+_ST_INITIALIZED = False
 
-print("[SeeThrough] Importing see-through modules...", flush=True)
-import cv2
-from safetensors.torch import load_file
 
-from modules.layerdiffuse.diffusers_kdiffusion_sdxl import KDiffusionStableDiffusionXLPipeline
-from modules.layerdiffuse.layerdiff3d import UNetFrameConditionModel
-from modules.layerdiffuse.vae import TransparentVAE
-from modules.marigold import MarigoldDepthPipeline
-from utils.cv import center_square_pad_resize, img_alpha_blending, smart_resize
-from utils.torchcv import cluster_inpaint_part
+def _st_lazy_init():
+    """Import cv2, safetensors, and all see-through modules on first node use."""
+    global _ST_INITIALIZED, cv2, load_file
+    global KDiffusionStableDiffusionXLPipeline, UNetFrameConditionModel, TransparentVAE
+    global MarigoldDepthPipeline
+    global center_square_pad_resize, img_alpha_blending, smart_resize, cluster_inpaint_part
 
-print("[SeeThrough] All see-through imports OK", flush=True)
+    if _ST_INITIALIZED:
+        return
+    _ST_INITIALIZED = True
 
-for _key, _mod in _st_conflict_backup.items():
-    if _key not in sys.modules:
-        sys.modules[_key] = _mod
-del _st_conflict_backup
+    print("[SeeThrough] Lazy-loading see-through modules (first use)...", flush=True)
+
+    # Mock pycocotools if not installed
+    try:
+        import pycocotools  # noqa: F401
+    except ImportError:
+        import types as _types
+        _mock_pycocotools = _types.ModuleType("pycocotools")
+        _mock_mask = _types.ModuleType("pycocotools.mask")
+        _mock_pycocotools.mask = _mock_mask
+        sys.modules["pycocotools"] = _mock_pycocotools
+        sys.modules["pycocotools.mask"] = _mock_mask
+
+    # Temporarily remove conflicting cached entries so see-through's own
+    # utils/ and modules/ are imported from the correct path.
+    _st_conflict_backup = {}
+    for _prefix in ("utils", "modules"):
+        for _key in list(sys.modules.keys()):
+            if _key == _prefix or _key.startswith(_prefix + "."):
+                _st_conflict_backup[_key] = sys.modules.pop(_key)
+    if _st_conflict_backup:
+        print(f"[SeeThrough] Temporarily removed {len(_st_conflict_backup)} conflicting sys.modules entries: "
+              f"{list(_st_conflict_backup.keys())[:10]}{'...' if len(_st_conflict_backup) > 10 else ''}", flush=True)
+
+    import cv2
+    from safetensors.torch import load_file
+    from modules.layerdiffuse.diffusers_kdiffusion_sdxl import KDiffusionStableDiffusionXLPipeline
+    from modules.layerdiffuse.layerdiff3d import UNetFrameConditionModel
+    from modules.layerdiffuse.vae import TransparentVAE
+    from modules.marigold import MarigoldDepthPipeline
+    from utils.cv import center_square_pad_resize, img_alpha_blending, smart_resize
+    from utils.torchcv import cluster_inpaint_part
+
+    for _key, _mod in _st_conflict_backup.items():
+        if _key not in sys.modules:
+            sys.modules[_key] = _mod
+
+    print("[SeeThrough] All see-through imports OK", flush=True)
 
 DEFAULT_LAYERDIFF_REPO = "layerdifforg/seethroughv0.0.2_layerdiff3d"
 DEFAULT_LAYERDIFF_NF4_REPO = "24yearsold/seethroughv0.0.2_layerdiff3d_nf4"
@@ -295,6 +310,7 @@ class SeeThrough_LoadLayerDiffModel:
     CATEGORY = "SeeThrough"
 
     def load_model(self, model, vae_ckpt="", unet_ckpt="", quant_mode="none", cache_tag_embeds=True, group_offload=False):
+        _st_lazy_init()
         use_nf4 = quant_mode == "nf4"
         dtype = torch.bfloat16
 
@@ -392,6 +408,7 @@ class SeeThrough_LoadDepthModel:
     CATEGORY = "SeeThrough"
 
     def load_model(self, model, quant_mode="none", cache_tag_embeds=True, group_offload=False):
+        _st_lazy_init()
         use_nf4 = quant_mode == "nf4"
         dtype = torch.bfloat16
 
@@ -454,6 +471,7 @@ class SeeThrough_GenerateLayers:
     CATEGORY = "SeeThrough"
 
     def generate(self, image, layerdiff_model, seed=42, resolution=1280, num_inference_steps=30):
+        _st_lazy_init()
         pipeline = layerdiff_model
         device = mm.get_torch_device()
         offload = torch.device("cpu")
@@ -604,6 +622,7 @@ class SeeThrough_GenerateDepth:
     CATEGORY = "SeeThrough"
 
     def generate(self, layers, depth_model, seed=42, resolution_depth=-1):
+        _st_lazy_init()
         layer_dict = layers.layer_dict
         fullpage = layers.fullpage
         resolution = layers.resolution
@@ -735,6 +754,7 @@ class SeeThrough_PostProcess:
     CATEGORY = "SeeThrough"
 
     def process(self, layers_depth, tblr_split=True, use_lama=True):
+        _st_lazy_init()
         layer_dict = layers_depth.layer_dict
         depth_dict = layers_depth.depth_dict
         fullpage = layers_depth.fullpage
