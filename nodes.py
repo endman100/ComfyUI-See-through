@@ -913,6 +913,93 @@ class SeeThrough_SavePSD:
         return (info_path,)
 
 
+class SeeThrough_ExportPSD:
+    """新節點：直接輸出真正的多圖層 PSD，並寫入標準 ComfyUI history outputs。"""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "parts": ("SEETHROUGH_PARTS",),
+                "filename_prefix": ("STRING", {"default": "seethrough"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("psd_path",)
+    FUNCTION = "export"
+    CATEGORY = "SeeThrough"
+    OUTPUT_NODE = True
+
+    def export(self, parts, filename_prefix="seethrough"):
+        from PIL import Image
+
+        try:
+            from psd_tools import PSDImage
+            from psd_tools.api.layers import PixelLayer
+            HAS_PSD_TOOLS = True
+        except ImportError:
+            HAS_PSD_TOOLS = False
+            print("[SeeThrough] psd-tools not installed. Run: pip install psd-tools", flush=True)
+
+        tag2pinfo  = parts["tag2pinfo"]
+        frame_size = parts["frame_size"]
+        canvas_h, canvas_w = frame_size
+
+        output_dir = folder_paths.get_output_directory()
+        ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        uid = str(uuid.uuid4())[:8]
+
+        sorted_tags = sorted(
+            tag2pinfo.keys(),
+            key=lambda t: tag2pinfo[t].get("depth_median", 1),
+            reverse=True,
+        )
+
+        psd_filename = f"{filename_prefix}_{ts}_{uid}.psd"
+        psd_path     = os.path.join(output_dir, psd_filename)
+
+        if HAS_PSD_TOOLS:
+            psd = PSDImage.new("RGBA", (int(canvas_w), int(canvas_h)))
+
+        layer_count = 0
+        for tag in sorted_tags:
+            pinfo  = tag2pinfo[tag]
+            img_np = pinfo.get("img")
+            if img_np is None:
+                continue
+
+            xyxy        = pinfo.get("xyxy", [0, 0, img_np.shape[1], img_np.shape[0]])
+            x1, y1, _, _ = [int(v) for v in xyxy]
+
+            if HAS_PSD_TOOLS:
+                img_pil      = Image.fromarray(img_np).convert("RGBA")
+                canvas_layer = Image.new("RGBA", (int(canvas_w), int(canvas_h)), (0, 0, 0, 0))
+                canvas_layer.paste(img_pil, (x1, y1))
+                pixel_layer = PixelLayer.frompil(
+                    canvas_layer,
+                    psd_file=psd,
+                    layer_name=tag,
+                    top=0,
+                    left=0,
+                )
+                psd.append(pixel_layer)
+                layer_count += 1
+
+        if HAS_PSD_TOOLS:
+            psd.save(psd_path)
+            print(f"[SeeThrough] ExportPSD: {psd_path} ({layer_count} layers)", flush=True)
+        else:
+            # fallback: 空檔案
+            open(psd_path, "w").close()
+
+        # ── 標準 ComfyUI history outputs 格式 ────────────────────────────────
+        return {
+            "ui":     {"psd_files": [{"filename": psd_filename, "subfolder": "", "type": "output"}]},
+            "result": (psd_path,),
+        }
+
+
 NODE_CLASS_MAPPINGS = {
     "SeeThrough_LoadLayerDiffModel": SeeThrough_LoadLayerDiffModel,
     "SeeThrough_LoadDepthModel": SeeThrough_LoadDepthModel,
@@ -920,6 +1007,7 @@ NODE_CLASS_MAPPINGS = {
     "SeeThrough_GenerateDepth": SeeThrough_GenerateDepth,
     "SeeThrough_PostProcess": SeeThrough_PostProcess,
     "SeeThrough_SavePSD": SeeThrough_SavePSD,
+    "SeeThrough_ExportPSD": SeeThrough_ExportPSD,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -929,4 +1017,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SeeThrough_GenerateDepth": "SeeThrough Generate Depth",
     "SeeThrough_PostProcess": "SeeThrough Post Process",
     "SeeThrough_SavePSD": "SeeThrough Save PSD",
+    "SeeThrough_ExportPSD": "SeeThrough Export PSD",
 }
