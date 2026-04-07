@@ -31,14 +31,8 @@ print(f"[SeeThrough] CURRENT_DIR = {CURRENT_DIR}", flush=True)
 print(f"[SeeThrough] SEETHROUGH_COMMON_DIR = {SEETHROUGH_COMMON_DIR}", flush=True)
 print(f"[SeeThrough] common dir exists = {os.path.isdir(SEETHROUGH_COMMON_DIR)}", flush=True)
 
-# Set up search paths immediately (cheap string ops; must precede lazy imports)
-if SEETHROUGH_COMMON_DIR not in sys.path:
-    sys.path.insert(0, SEETHROUGH_COMMON_DIR)
-    print(f"[SeeThrough] Added to sys.path: {SEETHROUGH_COMMON_DIR}", flush=True)
-
-if SEETHROUGH_ROOT_DIR not in sys.path:
-    sys.path.insert(1, SEETHROUGH_ROOT_DIR)
-    print(f"[SeeThrough] Added to sys.path: {SEETHROUGH_ROOT_DIR}", flush=True)
+# sys.path is set up inside _st_lazy_init() right before imports to avoid
+# being displaced by other custom nodes that insert paths at startup.
 
 # Heavy see-through imports are deferred to _st_lazy_init() to speed up ComfyUI startup.
 _ST_INITIALIZED = False
@@ -67,6 +61,15 @@ def _st_lazy_init():
         _mock_pycocotools.mask = _mock_mask
         sys.modules["pycocotools"] = _mock_pycocotools
         sys.modules["pycocotools.mask"] = _mock_mask
+
+    # Set up search paths here (deferred) so they are always at the front,
+    # regardless of what other custom nodes inserted during startup.
+    for _p in (SEETHROUGH_ROOT_DIR, SEETHROUGH_COMMON_DIR):
+        if _p in sys.path:
+            sys.path.remove(_p)
+    sys.path.insert(0, SEETHROUGH_ROOT_DIR)
+    sys.path.insert(0, SEETHROUGH_COMMON_DIR)
+    print(f"[SeeThrough] sys.path set: [0]={SEETHROUGH_COMMON_DIR}", flush=True)
 
     # Temporarily remove conflicting cached entries so see-through's own
     # utils/ and modules/ are imported from the correct path.
@@ -996,13 +999,13 @@ class SeeThrough_ExportPSD:
                 img_pil      = Image.fromarray(img_np).convert("RGBA")
                 canvas_layer = Image.new("RGBA", (int(canvas_w), int(canvas_h)), (0, 0, 0, 0))
                 canvas_layer.paste(img_pil, (x1, y1))
-                pixel_layer = PixelLayer.frompil(
-                    canvas_layer,
-                    psd_file=psd,
-                    layer_name=tag,
-                    top=0,
-                    left=0,
-                )
+                try:
+                    # psd-tools < 1.9.27: frompil(image, psd_file, layer_name, top, left)
+                    pixel_layer = PixelLayer.frompil(canvas_layer, psd, tag, 0, 0)
+                except TypeError:
+                    # psd-tools >= 1.9.27: frompil(image, compression=...)
+                    pixel_layer = PixelLayer.frompil(canvas_layer)
+                    pixel_layer.name = tag
                 psd.append(pixel_layer)
                 layer_count += 1
 
